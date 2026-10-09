@@ -1,0 +1,16 @@
+# TUYỆT ĐỐI không đưa token lên GitHub
+.env
+.env.*
+!.env.example
+.env.txt
+
+# Dữ liệu chạy thật
+reports.json
+reports.json.tmp
+settings.json
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
