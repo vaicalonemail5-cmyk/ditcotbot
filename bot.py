@@ -7,6 +7,8 @@ Chạy:     DISCORD_TOKEN=xxx WEBHOOK_CHANNEL_ID=123 python bot.py
 """
 
 import asyncio
+import csv
+import io
 import json
 import os
 import re
@@ -932,34 +934,42 @@ async def top(
     embeds = build_list_embeds(f"🏆 Top {len(rows)} theo {label} (trong {len(reports)} acc)", lines)
     await interaction.response.send_message(embeds=embeds, ephemeral=PRIVATE_REPLIES)
 
-import io
+
+# ---------- /search: tìm stats theo danh sách username trong file ----------
+SEARCH_DEFAULT = 5000        # số tin nhắn gần nhất sẽ tìm (dừng sớm nếu đã thấy đủ username)
+SEARCH_MAX_NAMES = 500       # tối đa số username trong 1 file
+SEARCH_MAX_BYTES = 256 * 1024
+SEARCH_SHOW = 300            # số acc hiện trong embed; đầy đủ nằm trong file CSV đính kèm
 
 
-def extract_usernames(content: str) -> list[str]:
-    """Đọc danh sách username từ nội dung file (hỗ trợ mỗi dòng 1 tên, hoặc dạng user:pass, CSV)."""
-    seen: set[str] = set()
-    usernames: list[str] = []
-    for raw_line in content.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or line.startswith("//"):
+def parse_usernames(raw: bytes) -> list[str] | None:
+    """Đọc username từ file: mỗi dòng một tên (hoặc cách nhau bằng , ; khoảng trắng).
+    Bỏ tên trùng (không phân biệt hoa thường). Trả về None nếu không phải file văn bản."""
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):  # UTF-16 (Notepad/PowerShell đời cũ hay lưu kiểu này)
+        text = raw.decode("utf-16", errors="replace")
+    elif b"\x00" in raw:
+        return None
+    else:
+        text = raw.decode("utf-8-sig", errors="replace")
+    names, seen = [], set()
+    for token in re.split(r"[\s,;]+", text):
+        name = token.strip("\"'`")
+        if not name or name.lower() in seen:
             continue
-        # Lấy phần username nếu file có định dạng user:pass, user|pass, hoặc CSV
-        token = re.split(r"[:|,;\t\s]+", line)[0].strip()
-        key = token.lower()
-        if token and key not in seen:
-            seen.add(key)
-            usernames.append(token)
-    return usernames
+        seen.add(name.lower())
+        names.append(name)
+    return names
 
 
-async def scan_for_users(
-    channel, target_keys: set[str], limit: int
-) -> tuple[int, int, int]:
-    """Quét kênh webhook để tìm các username trong danh sách và dừng sớm khi đã tìm đủ."""
-    scanned: dict[str, dict] = {}
-    remaining = set(target_keys)
-    messages = logs = 0
-
+async def search_history(
+    channel, wanted: dict[str, str], limit: int
+) -> tuple[int, dict[str, dict], bool]:
+    """Đọc mới -> cũ, lấy log MỚI NHẤT của mỗi username trong `wanted` ({tên_thường: tên_gốc}).
+    Dừng sớm khi đã thấy đủ. Chỉ đọc, không ghi vào reports.
+    Trả về (số tin đã đọc, kết quả theo user, có dừng sớm không)."""
+    found: dict[str, dict] = {}
+    messages = 0
+    stopped_early = False
     async for message in channel.history(limit=limit, oldest_first=False):
         messages += 1
         if message.webhook_id is None:
@@ -968,138 +978,162 @@ async def scan_for_users(
             user = embed_user(embed)
             if not user:
                 continue
-            logs += 1
             key = user.lower()
-            if key in scanned:
+            if key not in wanted or key in found:
                 continue
-            metadata = message_metadata(message)
-            scanned[key] = {"latest": None}
-            remaining.discard(key)
-            if is_newer_report(metadata, reports.get(key)):
-                data = parse_embed(embed)
-                if data is not None:
-                    data.update(metadata)
-                    scanned[key]["latest"] = data
-        if not remaining:
+            data = parse_embed(embed)
+            if data is None:
+                continue
+            found[key] = {
+                "data": data,
+                "ts": int((message.edited_at or message.created_at).timestamp()),
+                "url": message.jump_url,
+            }
+        if len(found) == len(wanted):
+            stopped_early = True
             break
-
-    new_users, updated = merge_scanned(scanned)
-    if new_users or updated:
-        save_data()
-    return messages, new_users, updated
+    return messages, found, stopped_early
 
 
-@bot.tree.command(
-    name="search",
-    description="Import file chứa username để tìm trong webhook và trả về Gems, Gold, Prestige",
-)
+def csv_safe(value: str) -> str:
+    """Chặn công thức Excel (=, +, -, @ ở đầu ô)."""
+    return "'" + value if value[:1] in ("=", "+", "-", "@") else value
+
+
+def build_search_csv(wanted: dict[str, str], found: dict[str, dict]) -> bytes:
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["username", "found", "gems", "gold", "prestige", "log_time_utc"])
+    for key, name in wanted.items():
+        info = found.get(key)
+        if not info:
+            writer.writerow([csv_safe(name), "no", "", "", "", ""])
+            continue
+        s = player_stats(info["data"])
+        when = datetime.fromtimestamp(info["ts"], timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        writer.writerow([
+            csv_safe(info["data"]["user"]), "yes",
+            to_int(s.get("gems")), to_int(s.get("gold")), to_int(s.get("prestige")), when,
+        ])
+    return buf.getvalue().encode("utf-8-sig")  # BOM để Excel mở đúng tiếng Việt
+
+
+def build_search_embeds(wanted: dict[str, str], found: dict[str, dict]) -> list[discord.Embed]:
+    lines = []
+    for key in wanted:  # giữ nguyên thứ tự trong file
+        info = found.get(key)
+        if not info:
+            continue
+        s = player_stats(info["data"])
+        lines.append(
+            f"**{info['data']['user']}**\n└ "
+            f"Gems: {s.get('gems', 'N/A')} · Gold: {s.get('gold', 'N/A')} · "
+            f"Prestige: {s.get('prestige', 'N/A')} · <t:{info['ts']}:R>"
+        )
+    if len(lines) > SEARCH_SHOW:
+        extra = len(lines) - SEARCH_SHOW
+        lines = lines[:SEARCH_SHOW] + [f"*… và {extra} acc nữa, xem đầy đủ trong file CSV đính kèm.*"]
+
+    missing = [name for key, name in wanted.items() if key not in found]
+    if missing:
+        text = ", ".join(missing)
+        if len(text) > 1500:
+            text = text[:1500].rsplit(", ", 1)[0] + ", … (xem đầy đủ trong file CSV)"
+        lines.append(f"\n❌ **Không tìm thấy ({len(missing)}):** {text}")
+    return build_list_embeds(f"🔎 Kết quả tìm kiếm ({len(found)}/{len(wanted)})", lines)
+
+
+@bot.tree.command(name="search", description="Nhập file username, tìm stats (Gems, Gold, Prestige) trong chat webhook")
 @app_commands.describe(
-    file="File (.txt, .csv...) chứa danh sách username cần tra cứu",
-    scan_limit=f"Số tin nhắn webhook quét thêm nếu thiếu dữ liệu (mặc định {SCAN_DEFAULT}, 0 = chỉ tìm dữ liệu đã lưu)",
+    file="File .txt/.csv chứa username (mỗi dòng một tên)",
+    limit=f"Số tin nhắn gần nhất cần tìm (mặc định {SEARCH_DEFAULT}, tối đa {SCAN_MAX})",
 )
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.guild_only()
 async def search(
     interaction: discord.Interaction,
     file: discord.Attachment,
-    scan_limit: app_commands.Range[int, 0, SCAN_MAX] = SCAN_DEFAULT,
+    limit: app_commands.Range[int, 1, SCAN_MAX] = SEARCH_DEFAULT,
 ) -> None:
-    if file.size > 5 * 1024 * 1024:
+    if file.size > SEARCH_MAX_BYTES:
         await interaction.response.send_message(
-            "❌ File quá lớn (tối đa 5MB).", ephemeral=True
+            f"❌ File quá lớn ({file.size // 1024} KB, tối đa {SEARCH_MAX_BYTES // 1024} KB).",
+            ephemeral=True,
+        )
+        return
+
+    channel = interaction.channel
+    if CHANNEL_ID:
+        try:
+            channel = bot.get_channel(CHANNEL_ID) or await bot.fetch_channel(CHANNEL_ID)
+        except discord.HTTPException:
+            await interaction.response.send_message(
+                f"❌ Không truy cập được kênh webhook `{CHANNEL_ID}` (WEBHOOK_CHANNEL_ID).",
+                ephemeral=True,
+            )
+            return
+
+    if _scan_lock.locked():
+        await interaction.response.send_message(
+            "Đang có một lần quét/tìm kiếm chạy rồi, đợi nó xong nhé.", ephemeral=True
         )
         return
 
     await interaction.response.defer(ephemeral=PRIVATE_REPLIES, thinking=True)
 
+    async def fail(text: str) -> None:
+        await interaction.followup.send(text, ephemeral=PRIVATE_REPLIES)
+
     try:
-        raw_bytes = await file.read()
-        content = raw_bytes.decode("utf-8-sig", errors="replace")
-    except Exception as e:
-        await interaction.followup.send(
-            f"❌ Không đọc được file: {e}", ephemeral=PRIVATE_REPLIES
-        )
+        raw = await file.read()
+    except discord.HTTPException as e:
+        await fail(f"❌ Không tải được file: {e}")
         return
-
-    usernames = extract_usernames(content)
-    if not usernames:
-        await interaction.followup.send(
-            "❌ Không tìm thấy username nào trong file.", ephemeral=PRIVATE_REPLIES
-        )
+    names = parse_usernames(raw)
+    if names is None:
+        await fail("❌ File này không phải file văn bản. Hãy dùng .txt hoặc .csv, mỗi dòng một username.")
         return
-
-    target_keys = {u.lower() for u in usernames}
-    missing_keys = {k for k in target_keys if k not in reports}
-
-    # Nếu còn user chưa có trong bộ nhớ (hoặc cần quét thêm) và scan_limit > 0 thì quét kênh webhook
-    scanned_msgs = 0
-    if missing_keys and scan_limit > 0 and not _scan_lock.locked():
-        channel = interaction.channel
-        if CHANNEL_ID:
-            try:
-                channel = bot.get_channel(CHANNEL_ID) or await bot.fetch_channel(CHANNEL_ID)
-            except discord.HTTPException:
-                channel = None
-        if channel is not None:
-            async with _scan_lock:
-                try:
-                    scanned_msgs, _, _ = await scan_for_users(
-                        channel, missing_keys, scan_limit
-                    )
-                except discord.HTTPException:
-                    pass
-
-    found_lines: list[str] = []
-    txt_lines: list[str] = []
-    not_found: list[str] = []
-
-    for u in usernames:
-        data = reports.get(u.lower())
-        if not data:
-            not_found.append(u)
-            continue
-        s = player_stats(data)
-        gems = s.get("gems", "N/A")
-        gold = s.get("gold", "N/A")
-        prestige = s.get("prestige", "N/A")
-        dot = "🟢" if is_online(data) else "🔴"
-
-        found_lines.append(
-            f"{dot} **{data['user']}**\n"
-            f"└ Gems: `{gems}` · Gold: `{gold}` · Prestige: `{prestige}`"
-        )
-        txt_lines.append(
-            f"{data['user']} | Gems: {gems} | Gold: {gold} | Prestige: {prestige}"
-        )
-
-    if not found_lines:
-        await interaction.followup.send(
-            f"❌ Không tìm thấy log webhook nào cho **{len(usernames)}** username trong file `{file.filename}`.",
-            ephemeral=PRIVATE_REPLIES,
-        )
+    if not names:
+        await fail("❌ Không đọc được username nào trong file.")
         return
+    if len(names) > SEARCH_MAX_NAMES:
+        await fail(f"❌ File có {len(names)} username, tối đa {SEARCH_MAX_NAMES}. Hãy chia nhỏ file.")
+        return
+    wanted = {n.lower(): n for n in names}
 
-    if not_found:
-        preview = ", ".join(f"`{u}`" for u in not_found[:20])
-        more = f" (+{len(not_found) - 20} acc khác)" if len(not_found) > 20 else ""
-        found_lines.append(f"\n⚠️ **Chưa tìm thấy ({len(not_found)}):** {preview}{more}")
+    async with _scan_lock:
+        try:
+            messages, found, stopped_early = await search_history(channel, wanted, limit)
+        except discord.Forbidden:
+            await fail(
+                f"❌ Bot không có quyền **View Channel** và **Read Message History** ở <#{channel.id}>."
+            )
+            return
+        except discord.HTTPException as e:
+            await fail(f"❌ Lỗi khi đọc lịch sử: {e}")
+            return
 
-    title = (
-        f"🔍 Kết quả tìm kiếm: {len(txt_lines)}/{len(usernames)} acc "
-        f"(File: {file.filename})"
+    missing = len(wanted) - len(found)
+    print(f"[SEARCH] {len(wanted)} username, đọc {messages} tin, thấy {len(found)}, thiếu {missing}")
+    summary = (
+        f"🔎 Đã đọc **{messages}** tin nhắn trong <#{channel.id}> — "
+        f"tìm thấy **{len(found)}/{len(wanted)}** username."
     )
-    embeds = build_list_embeds(title, found_lines)
+    if stopped_early:
+        summary += " (đã thấy đủ nên dừng sớm)"
+    elif missing and messages >= limit:
+        summary += f"\n⚠️ Đã quét hết {limit} tin gần nhất mà vẫn thiếu {missing} tên. Thử tăng `limit` nếu cần."
+    elif missing:
+        summary += "\nĐã quét hết lịch sử kênh."
 
-    # Nếu danh sách quá dài hoặc cần lưu nhanh, đính kèm thêm file .txt
-    if len(txt_lines) > 40:
-        if not_found:
-            txt_lines.append(f"\n--- Chưa tìm thấy ({len(not_found)}) ---")
-            txt_lines.extend(not_found)
-        buf = io.BytesIO("\n".join(txt_lines).encode("utf-8"))
-        out_file = discord.File(buf, filename="search_stats.txt")
-        await interaction.followup.send(
-            embeds=embeds, file=out_file, ephemeral=PRIVATE_REPLIES
-        )
-    else:
-        await interaction.followup.send(embeds=embeds, ephemeral=PRIVATE_REPLIES)
+    csv_file = discord.File(io.BytesIO(build_search_csv(wanted, found)), filename="search_result.csv")
+    await interaction.followup.send(
+        content=summary,
+        embeds=build_search_embeds(wanted, found),
+        file=csv_file,
+        ephemeral=PRIVATE_REPLIES,
+    )
 
 
 # ---------- Điều khiển app trong VPS (chỉ app có trong apps.json) ----------
