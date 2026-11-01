@@ -932,6 +932,175 @@ async def top(
     embeds = build_list_embeds(f"🏆 Top {len(rows)} theo {label} (trong {len(reports)} acc)", lines)
     await interaction.response.send_message(embeds=embeds, ephemeral=PRIVATE_REPLIES)
 
+import io
+
+
+def extract_usernames(content: str) -> list[str]:
+    """Đọc danh sách username từ nội dung file (hỗ trợ mỗi dòng 1 tên, hoặc dạng user:pass, CSV)."""
+    seen: set[str] = set()
+    usernames: list[str] = []
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or line.startswith("//"):
+            continue
+        # Lấy phần username nếu file có định dạng user:pass, user|pass, hoặc CSV
+        token = re.split(r"[:|,;\t\s]+", line)[0].strip()
+        key = token.lower()
+        if token and key not in seen:
+            seen.add(key)
+            usernames.append(token)
+    return usernames
+
+
+async def scan_for_users(
+    channel, target_keys: set[str], limit: int
+) -> tuple[int, int, int]:
+    """Quét kênh webhook để tìm các username trong danh sách và dừng sớm khi đã tìm đủ."""
+    scanned: dict[str, dict] = {}
+    remaining = set(target_keys)
+    messages = logs = 0
+
+    async for message in channel.history(limit=limit, oldest_first=False):
+        messages += 1
+        if message.webhook_id is None:
+            continue
+        for embed in message.embeds:
+            user = embed_user(embed)
+            if not user:
+                continue
+            logs += 1
+            key = user.lower()
+            if key in scanned:
+                continue
+            metadata = message_metadata(message)
+            scanned[key] = {"latest": None}
+            remaining.discard(key)
+            if is_newer_report(metadata, reports.get(key)):
+                data = parse_embed(embed)
+                if data is not None:
+                    data.update(metadata)
+                    scanned[key]["latest"] = data
+        if not remaining:
+            break
+
+    new_users, updated = merge_scanned(scanned)
+    if new_users or updated:
+        save_data()
+    return messages, new_users, updated
+
+
+@bot.tree.command(
+    name="search",
+    description="Import file chứa username để tìm trong webhook và trả về Gems, Gold, Prestige",
+)
+@app_commands.describe(
+    file="File (.txt, .csv...) chứa danh sách username cần tra cứu",
+    scan_limit=f"Số tin nhắn webhook quét thêm nếu thiếu dữ liệu (mặc định {SCAN_DEFAULT}, 0 = chỉ tìm dữ liệu đã lưu)",
+)
+async def search(
+    interaction: discord.Interaction,
+    file: discord.Attachment,
+    scan_limit: app_commands.Range[int, 0, SCAN_MAX] = SCAN_DEFAULT,
+) -> None:
+    if file.size > 5 * 1024 * 1024:
+        await interaction.response.send_message(
+            "❌ File quá lớn (tối đa 5MB).", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=PRIVATE_REPLIES, thinking=True)
+
+    try:
+        raw_bytes = await file.read()
+        content = raw_bytes.decode("utf-8-sig", errors="replace")
+    except Exception as e:
+        await interaction.followup.send(
+            f"❌ Không đọc được file: {e}", ephemeral=PRIVATE_REPLIES
+        )
+        return
+
+    usernames = extract_usernames(content)
+    if not usernames:
+        await interaction.followup.send(
+            "❌ Không tìm thấy username nào trong file.", ephemeral=PRIVATE_REPLIES
+        )
+        return
+
+    target_keys = {u.lower() for u in usernames}
+    missing_keys = {k for k in target_keys if k not in reports}
+
+    # Nếu còn user chưa có trong bộ nhớ (hoặc cần quét thêm) và scan_limit > 0 thì quét kênh webhook
+    scanned_msgs = 0
+    if missing_keys and scan_limit > 0 and not _scan_lock.locked():
+        channel = interaction.channel
+        if CHANNEL_ID:
+            try:
+                channel = bot.get_channel(CHANNEL_ID) or await bot.fetch_channel(CHANNEL_ID)
+            except discord.HTTPException:
+                channel = None
+        if channel is not None:
+            async with _scan_lock:
+                try:
+                    scanned_msgs, _, _ = await scan_for_users(
+                        channel, missing_keys, scan_limit
+                    )
+                except discord.HTTPException:
+                    pass
+
+    found_lines: list[str] = []
+    txt_lines: list[str] = []
+    not_found: list[str] = []
+
+    for u in usernames:
+        data = reports.get(u.lower())
+        if not data:
+            not_found.append(u)
+            continue
+        s = player_stats(data)
+        gems = s.get("gems", "N/A")
+        gold = s.get("gold", "N/A")
+        prestige = s.get("prestige", "N/A")
+        dot = "🟢" if is_online(data) else "🔴"
+
+        found_lines.append(
+            f"{dot} **{data['user']}**\n"
+            f"└ Gems: `{gems}` · Gold: `{gold}` · Prestige: `{prestige}`"
+        )
+        txt_lines.append(
+            f"{data['user']} | Gems: {gems} | Gold: {gold} | Prestige: {prestige}"
+        )
+
+    if not found_lines:
+        await interaction.followup.send(
+            f"❌ Không tìm thấy log webhook nào cho **{len(usernames)}** username trong file `{file.filename}`.",
+            ephemeral=PRIVATE_REPLIES,
+        )
+        return
+
+    if not_found:
+        preview = ", ".join(f"`{u}`" for u in not_found[:20])
+        more = f" (+{len(not_found) - 20} acc khác)" if len(not_found) > 20 else ""
+        found_lines.append(f"\n⚠️ **Chưa tìm thấy ({len(not_found)}):** {preview}{more}")
+
+    title = (
+        f"🔍 Kết quả tìm kiếm: {len(txt_lines)}/{len(usernames)} acc "
+        f"(File: {file.filename})"
+    )
+    embeds = build_list_embeds(title, found_lines)
+
+    # Nếu danh sách quá dài hoặc cần lưu nhanh, đính kèm thêm file .txt
+    if len(txt_lines) > 40:
+        if not_found:
+            txt_lines.append(f"\n--- Chưa tìm thấy ({len(not_found)}) ---")
+            txt_lines.extend(not_found)
+        buf = io.BytesIO("\n".join(txt_lines).encode("utf-8"))
+        out_file = discord.File(buf, filename="search_stats.txt")
+        await interaction.followup.send(
+            embeds=embeds, file=out_file, ephemeral=PRIVATE_REPLIES
+        )
+    else:
+        await interaction.followup.send(embeds=embeds, ephemeral=PRIVATE_REPLIES)
+
 
 # ---------- Điều khiển app trong VPS (chỉ app có trong apps.json) ----------
 APPS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "apps.json")
