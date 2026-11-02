@@ -365,10 +365,13 @@ async def on_app_command_error(
         msg = "Bạn cần quyền **Manage Server** để dùng lệnh này."
     else:
         msg = "Có lỗi khi chạy lệnh, xem cửa sổ terminal của bot để biết chi tiết."
-    if interaction.response.is_done():
-        await interaction.followup.send(msg, ephemeral=True)
-    else:
-        await interaction.response.send_message(msg, ephemeral=True)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except discord.HTTPException:
+        pass
 
 
 def find_user(name: str) -> dict | None:
@@ -495,6 +498,10 @@ def to_int(value: str | None) -> int:
     return int(digits) if digits else 0
 
 
+EMBED_TOTAL_MAX = 6000
+EMBED_BATCH_MAX = 10
+
+
 def build_list_embeds(title: str, lines: list[str]) -> list[discord.Embed]:
     """Ghép các dòng thành embed, tự chia nhỏ nếu quá dài (mỗi embed tối đa 4096 ký tự)."""
     chunks, current = [], ""
@@ -507,12 +514,49 @@ def build_list_embeds(title: str, lines: list[str]) -> list[discord.Embed]:
         chunks.append(current)
 
     embeds = []
-    for i, text in enumerate(chunks[:10]):  # Discord cho tối đa 10 embed / tin nhắn
+    for i, text in enumerate(chunks):
         embed = discord.Embed(description=text, color=0x2B2D31)
         if i == 0:
             embed.title = title
         embeds.append(embed)
     return embeds
+
+
+def embed_char_count(embed: discord.Embed) -> int:
+    return len(embed.title or "") + len(embed.description or "")
+
+
+def split_embed_batches(embeds: list[discord.Embed]) -> list[list[discord.Embed]]:
+    """Chia danh sách embed thành từng gói <= 10 embed và <= 6000 ký tự cho mỗi tin nhắn Discord."""
+    batches: list[list[discord.Embed]] = []
+    current: list[discord.Embed] = []
+    current_len = 0
+    for embed in embeds:
+        elen = embed_char_count(embed)
+        if current and (len(current) >= EMBED_BATCH_MAX or current_len + elen > EMBED_TOTAL_MAX):
+            batches.append(current)
+            current = []
+            current_len = 0
+        current.append(embed)
+        current_len += elen
+    if current:
+        batches.append(current)
+    return batches
+
+
+async def send_embeds(
+    interaction: discord.Interaction,
+    embeds: list[discord.Embed],
+    *,
+    ephemeral: bool = PRIVATE_REPLIES,
+) -> None:
+    """Gửi danh sách embed; tự chia thành nhiều tin nhắn followup nếu tổng ký tự vượt 6000."""
+    batches = split_embed_batches(embeds)
+    if not batches:
+        return
+    await interaction.response.send_message(embeds=batches[0], ephemeral=ephemeral)
+    for batch in batches[1:]:
+        await interaction.followup.send(embeds=batch, ephemeral=ephemeral)
 
 
 def build_time_embeds() -> list[discord.Embed]:
@@ -569,7 +613,7 @@ async def report(interaction: discord.Interaction, user: str) -> None:
             )
             return
         embeds = build_time_embeds() if key == "all" else build_stats_embeds()
-        await interaction.response.send_message(embeds=embeds, ephemeral=PRIVATE_REPLIES)
+        await send_embeds(interaction, embeds, ephemeral=PRIVATE_REPLIES)
         return
 
     data = find_user(user)
@@ -780,7 +824,7 @@ async def restart(interaction: discord.Interaction) -> None:
 
 # ---------- Quét log cũ & xếp hạng acc có stats cao nhất ----------
 SCAN_DEFAULT = 1000
-SCAN_MAX = 50000
+SCAN_MAX = 500000
 _scan_lock = asyncio.Lock()
 
 
@@ -794,6 +838,8 @@ async def scan_channel(channel, limit: int) -> tuple[int, int, dict[str, dict]]:
     messages = logs = 0
     async for message in channel.history(limit=limit, oldest_first=False):
         messages += 1
+        if messages % 10000 == 0:
+            print(f"[SCAN] Đang quét... {messages}/{limit} tin nhắn ({logs} log, {len(scanned)} user)")
         if message.webhook_id is None:
             continue
         for embed in message.embeds:
@@ -876,15 +922,26 @@ async def scan(
             save_data()
 
     print(f"[SCAN] {messages} tin nhắn, {logs} log, {len(scanned)} user ({new_users} mới)")
-    await interaction.followup.send(
+    summary = (
         f"✅ Đã quét **{messages}** tin nhắn trong <#{channel.id}>\n"
         f"• Log hợp lệ: **{logs}** · Số acc tìm thấy: **{len(scanned)}**\n"
         f"• Acc mới thêm: **{new_users}** · Acc được cập nhật: **{updated}**\n"
         f"• Log bỏ qua (trùng/cũ/đã có): **{logs - new_users - updated}**\n"
-        f"Dùng `/top` để xem acc có stats cao nhất.",
-        ephemeral=PRIVATE_REPLIES,
+        f"Dùng `/top` để xem acc có stats cao nhất."
     )
+    try:
+        await interaction.followup.send(summary, ephemeral=PRIVATE_REPLIES)
+    except discord.HTTPException:
+        target_ch = getattr(interaction, "channel", None) or channel
+        if hasattr(target_ch, "send"):
+            try:
+                await target_ch.send(summary)
+            except discord.HTTPException:
+                pass
 
+
+TOP_DEFAULT = 10
+TOP_MAX = 200
 
 TOP_SORTS = {
     "prestige": ("Prestige", lambda s: (to_int(s.get("prestige")), to_int(s.get("level")), to_int(s.get("gold")))),
@@ -895,7 +952,10 @@ TOP_SORTS = {
 
 
 @bot.tree.command(name="top", description="Xếp hạng các acc có stats cao nhất")
-@app_commands.describe(by="Xếp hạng theo", count="Số acc hiển thị (mặc định 10, tối đa 25)")
+@app_commands.describe(
+    by="Xếp hạng theo",
+    count=f"Số acc hiển thị (mặc định {TOP_DEFAULT}, tối đa {TOP_MAX})",
+)
 @app_commands.choices(
     by=[
         app_commands.Choice(name="Prestige (rồi đến Level)", value="prestige"),
@@ -907,7 +967,7 @@ TOP_SORTS = {
 async def top(
     interaction: discord.Interaction,
     by: str = "prestige",
-    count: app_commands.Range[int, 1, 25] = 10,
+    count: app_commands.Range[int, 1, TOP_MAX] = TOP_DEFAULT,
 ) -> None:
     if not reports:
         await interaction.response.send_message(
@@ -932,7 +992,7 @@ async def top(
         )
     lines.append("*Dựa trên log gần nhất của mỗi acc. Dùng /scan để nạp thêm log cũ.*")
     embeds = build_list_embeds(f"🏆 Top {len(rows)} theo {label} (trong {len(reports)} acc)", lines)
-    await interaction.response.send_message(embeds=embeds, ephemeral=PRIVATE_REPLIES)
+    await send_embeds(interaction, embeds, ephemeral=PRIVATE_REPLIES)
 
 
 # ---------- /search: tìm stats theo danh sách username trong file ----------
@@ -1128,12 +1188,15 @@ async def search(
         summary += "\nĐã quét hết lịch sử kênh."
 
     csv_file = discord.File(io.BytesIO(build_search_csv(wanted, found)), filename="search_result.csv")
+    embed_batches = split_embed_batches(build_search_embeds(wanted, found))
     await interaction.followup.send(
         content=summary,
-        embeds=build_search_embeds(wanted, found),
+        embeds=embed_batches[0] if embed_batches else [],
         file=csv_file,
         ephemeral=PRIVATE_REPLIES,
     )
+    for batch in embed_batches[1:]:
+        await interaction.followup.send(embeds=batch, ephemeral=PRIVATE_REPLIES)
 
 
 # ---------- Điều khiển app trong VPS (chỉ app có trong apps.json) ----------
